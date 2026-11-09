@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dial Commander Art</title>
+<style>
+  :root {
+    --bg: #0e0f13; --panel: #181a21; --line: #2a2d38; --text: #ecedf2;
+    --dim: #8b8fa3; --accent: #e0b84c; --ok: #4fc97a; --err: #ef5a5a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px 40px;
+  }
+  main { max-width: 520px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: grid; gap: 10px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0; }
+  button {
+    font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 12px 14px;
+    background: var(--accent); color: #1a1405; cursor: pointer;
+  }
+  button.secondary { background: var(--line); color: var(--text); }
+  button:disabled { opacity: .45; }
+  input[type=text] {
+    font: inherit; width: 100%; padding: 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > input[type=text] { flex: 1; }
+  .status { font-size: 14px; color: var(--dim); }
+  .status.ok { color: var(--ok); } .status.err { color: var(--err); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); flex: none; }
+  .dot.on { background: var(--ok); }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .grid img { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 8px; border: 2px solid transparent; cursor: pointer; }
+  .grid img.sel { border-color: var(--accent); }
+  .grid figure { margin: 0; }
+  .grid figcaption { font-size: 12px; color: var(--dim); text-align: center; }
+  .preview { position: relative; width: 240px; height: 240px; margin: 4px auto; touch-action: none; }
+  .preview canvas { width: 240px; height: 240px; border-radius: 50%; display: block; background: #000; }
+  .preview .life {
+    position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none;
+    font: 700 84px/1 "SF Mono", ui-monospace, monospace; color: #fff;
+    text-shadow: 0 0 3px #000, 0 0 3px #000, 2px 2px 0 #000, -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000;
+  }
+  label { display: grid; grid-template-columns: 80px 1fr; align-items: center; gap: 10px; font-size: 14px; color: var(--dim); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  progress { width: 100%; height: 8px; accent-color: var(--accent); }
+  .hint { font-size: 13px; color: var(--dim); margin: 0; }
+  #nobt { border-color: var(--err); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Dial Commander Art</h1>
+
+  <section id="nobt" hidden>
+    <strong>Bluetooth isn't available in this browser.</strong>
+    <p class="hint">On iPhone, open this page in the free <b>Bluefy</b> browser from the App Store. On Android, use Chrome.</p>
+  </section>
+
+  <section>
+    <h2>Dial</h2>
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span class="status" id="btStatus">Not connected</span>
+    </div>
+    <div class="row">
+      <button id="connectBtn">Connect to Dial</button>
+      <button id="clearBtn" class="secondary" disabled>Clear art</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Find your commander</h2>
+    <form class="row" id="searchForm">
+      <input type="text" id="q" list="names" placeholder="e.g. Atraxa" autocomplete="off" autocapitalize="words">
+      <button type="submit">Search</button>
+    </form>
+    <datalist id="names"></datalist>
+    <span class="status" id="searchStatus"></span>
+    <div class="grid" id="results"></div>
+    <div class="row">
+      <label style="display:flex;gap:8px;color:var(--dim)"><span>…or use your own image:</span>
+        <input type="file" id="file" accept="image/*"></label>
+    </div>
+  </section>
+
+  <section id="editor" hidden>
+    <h2>Crop &amp; send</h2>
+    <div class="preview" id="preview">
+      <canvas id="cv" width="240" height="240"></canvas>
+      <div class="life">40</div>
+    </div>
+    <p class="hint" style="text-align:center">Drag the art to reposition.</p>
+    <label>Zoom <input type="range" id="zoom" min="1" max="3" step="0.01" value="1"></label>
+    <label>Darken <input type="range" id="dark" min="0" max="0.8" step="0.01" value="0.4"></label>
+    <button id="sendBtn" disabled>Send to Dial</button>
+    <progress id="prog" value="0" max="1" hidden></progress>
+    <span class="status" id="sendStatus"></span>
+  </section>
+</main>
+
+<script>
+const SVC  = '8d2b0001-5c3a-4e8f-9b7a-2f1e6c4d3a10';
+const CTRL = '8d2b0002-5c3a-4e8f-9b7a-2f1e6c4d3a10';
+const DATA = '8d2b0003-5c3a-4e8f-9b7a-2f1e6c4d3a10';
+const CHUNK = 180;            // fits in one packet with iOS's usual MTU
+const MAX_BYTES = 60 * 1024;  // device limit is 64KB
+
+const $ = id => document.getElementById(id);
+const setStatus = (el, msg, cls = '') => { el.textContent = msg; el.className = 'status ' + cls; };
+
+// ---------------- Bluetooth ----------------
+let device = null, ctrlCh = null, dataCh = null;
+
+if (!navigator.bluetooth) { $('nobt').hidden = false; $('connectBtn').disabled = true; }
+
+function updateConn() {
+  const on = !!(device && device.gatt.connected && ctrlCh);
+  $('dot').classList.toggle('on', on);
+  setStatus($('btStatus'), on ? `Connected to ${device.name || 'Dial'}` : 'Not connected', on ? 'ok' : '');
+  $('connectBtn').textContent = on ? 'Disconnect' : 'Connect to Dial';
+  $('clearBtn').disabled = !on;
+  $('sendBtn').disabled = !(on && img);
+}
+
+async function attach() {
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SVC);
+  ctrlCh = await svc.getCharacteristic(CTRL);
+  dataCh = await svc.getCharacteristic(DATA);
+  updateConn();
+}
+
+async function ensureConnected() {
+  if (device && device.gatt.connected && ctrlCh) return;
+  if (!device) {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', () => { ctrlCh = dataCh = null; updateConn(); });
+  }
+  await attach();
+}
+
+const write = (ch, bytes) =>
+  ch.writeValueWithResponse ? ch.writeValueWithResponse(bytes) : ch.writeValue(bytes);
+
+async function readStatus() {
+  const v = await ctrlCh.readValue();
+  return new TextDecoder().decode(v.buffer);
+}
+
+$('connectBtn').onclick = async () => {
+  try {
+    if (device && device.gatt.connected) { device.gatt.disconnect(); return; }
+    setStatus($('btStatus'), 'Connecting…');
+    await ensureConnected();
+  } catch (e) { setStatus($('btStatus'), e.message, 'err'); }
+};
+
+$('clearBtn').onclick = async () => {
+  try {
+    await ensureConnected();
+    await write(ctrlCh, new Uint8Array([3]));
+    setStatus($('sendStatus'), 'Art cleared on the Dial.', 'ok');
+  } catch (e) { setStatus($('sendStatus'), e.message, 'err'); }
+};
+
+async function sendJpeg(bytes) {
+  await ensureConnected();
+  const head = new Uint8Array(5);
+  head[0] = 1;
+  new DataView(head.buffer).setUint32(1, bytes.length, true);
+  await write(ctrlCh, head);
+  let st = await readStatus();
+  if (st !== 'RX') throw new Error('Dial refused transfer: ' + st);
+
+  const prog = $('prog');
+  prog.hidden = false; prog.value = 0;
+  for (let off = 0; off < bytes.length; off += CHUNK) {
+    await write(dataCh, bytes.subarray(off, off + CHUNK));
+    prog.value = Math.min(1, (off + CHUNK) / bytes.length);
+  }
+  await write(ctrlCh, new Uint8Array([2]));
+  st = await readStatus();
+  if (st !== 'OK') throw new Error('Dial reported: ' + st);
+}
+
+// ---------------- Scryfall search ----------------
+let acTimer = null;
+$('q').addEventListener('input', () => {
+  clearTimeout(acTimer);
+  const q = $('q').value.trim();
+  if (q.length < 3) return;
+  acTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('https://api.scryfall.com/cards/autocomplete?q=' + encodeURIComponent(q));
+      const j = await r.json();
+      $('names').innerHTML = (j.data || []).map(n => `<option value="${n.replace(/"/g, '&quot;')}">`).join('');
+    } catch {}
+  }, 250);
+});
+
+const artOf = c => (c.image_uris || (c.card_faces && c.card_faces[0].image_uris) || {}).art_crop;
+
+// When a name is ambiguous ("atraxa"), offer the matching names as buttons.
+async function showChoices(q) {
+  const j = await (await fetch('https://api.scryfall.com/cards/autocomplete?q=' + encodeURIComponent(q))).json();
+  const names = j.data || [];
+  if (!names.length) return false;
+  setStatus($('searchStatus'), 'Several cards match. Pick one:');
+  for (const n of names) {
+    const b = document.createElement('button');
+    b.className = 'secondary';
+    b.textContent = n;
+    b.onclick = () => { $('q').value = n; $('searchForm').requestSubmit(); };
+    $('results').append(b);
+  }
+  return true;
+}
+
+$('searchForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const q = $('q').value.trim();
+  if (!q) return;
+  setStatus($('searchStatus'), 'Searching…');
+  $('results').innerHTML = '';
+  try {
+    // resolve the exact card name first (fuzzy), then list every unique art
+    const named = await (await fetch('https://api.scryfall.com/cards/named?fuzzy=' + encodeURIComponent(q))).json();
+    if (named.object === 'error') {
+      if (await showChoices(q)) return;
+      throw new Error(named.details);
+    }
+    const query = `!"${named.name}" unique:art`;
+    const list = await (await fetch('https://api.scryfall.com/cards/search?order=released&q=' + encodeURIComponent(query))).json();
+    const cards = (list.data || [named]).filter(artOf);
+    setStatus($('searchStatus'), `${named.name}: ${cards.length} artwork${cards.length === 1 ? '' : 's'}. Tap one.`);
+    for (const c of cards) {
+      const fig = document.createElement('figure');
+      const im = document.createElement('img');
+      im.src = artOf(c);
+      im.alt = `${c.name} (${c.set_name})`;
+      im.loading = 'lazy';
+      im.onclick = () => {
+        document.querySelectorAll('.grid img.sel').forEach(x => x.classList.remove('sel'));
+        im.classList.add('sel');
+        loadImage(artOf(c), true);
+      };
+      const cap = document.createElement('figcaption');
+      cap.textContent = `${c.set_name}${c.artist ? ' · ' + c.artist : ''}`;
+      fig.append(im, cap);
+      $('results').append(fig);
+    }
+    if (cards.length === 1) $('results').querySelector('img').click();
+  } catch (e) {
+    setStatus($('searchStatus'), e.message || 'Search failed', 'err');
+  }
+};
+
+$('file').onchange = () => {
+  const f = $('file').files[0];
+  if (f) loadImage(URL.createObjectURL(f), false);
+};
+
+// ---------------- crop editor ----------------
+const cv = $('cv'), ctx = cv.getContext('2d');
+let img = null, zoom = 1, panX = 0, panY = 0;
+
+function loadImage(src, cors) {
+  const im = new Image();
+  if (cors) im.crossOrigin = 'anonymous';
+  im.onload = () => {
+    img = im; zoom = 1; panX = 0; panY = 0;
+    $('zoom').value = 1;
+    $('editor').hidden = false;
+    draw(); updateConn();
+    $('editor').scrollIntoView({ behavior: 'smooth' });
+  };
+  im.onerror = () => setStatus($('searchStatus'), 'Could not load that image.', 'err');
+  im.src = src;
+}
+
+function geom() {
+  const s = Math.max(240 / img.width, 240 / img.height) * zoom;
+  const w = img.width * s, h = img.height * s;
+  const mx = (w - 240) / 2, my = (h - 240) / 2;
+  panX = Math.max(-mx, Math.min(mx, panX));
+  panY = Math.max(-my, Math.min(my, panY));
+  return { w, h, x: (240 - w) / 2 + panX, y: (240 - h) / 2 + panY };
+}
+
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, 240, 240);
+  if (!img) return;
+  const g = geom();
+  ctx.drawImage(img, g.x, g.y, g.w, g.h);
+  ctx.fillStyle = `rgba(0,0,0,${$('dark').value})`;
+  ctx.fillRect(0, 0, 240, 240);
+}
+
+$('zoom').oninput = () => { zoom = +$('zoom').value; draw(); };
+$('dark').oninput = draw;
+
+let drag = null;
+$('preview').addEventListener('pointerdown', e => {
+  drag = { x: e.clientX, y: e.clientY, px: panX, py: panY };
+  $('preview').setPointerCapture(e.pointerId);
+});
+$('preview').addEventListener('pointermove', e => {
+  if (!drag || !img) return;
+  panX = drag.px + (e.clientX - drag.x);
+  panY = drag.py + (e.clientY - drag.y);
+  draw();
+});
+$('preview').addEventListener('pointerup', () => drag = null);
+$('preview').addEventListener('pointercancel', () => drag = null);
+
+const toJpeg = q => new Promise((res, rej) =>
+  cv.toBlob(b => b ? res(b) : rej(new Error('Could not encode image')), 'image/jpeg', q));
+
+$('sendBtn').onclick = async () => {
+  const btn = $('sendBtn');
+  btn.disabled = true;
+  try {
+    let q = 0.88, blob = await toJpeg(q);
+    while (blob.size > MAX_BYTES && q > 0.4) { q -= 0.1; blob = await toJpeg(q); }
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    setStatus($('sendStatus'), `Sending ${(bytes.length / 1024).toFixed(1)} KB…`);
+    const t0 = performance.now();
+    await sendJpeg(bytes);
+    setStatus($('sendStatus'), `Sent in ${((performance.now() - t0) / 1000).toFixed(1)}s.`, 'ok');
+  } catch (e) {
+    const msg = e.name === 'SecurityError'
+      ? 'This image can\'t be exported (cross-origin). Try another artwork or upload a file.'
+      : e.message;
+    setStatus($('sendStatus'), msg, 'err');
+  } finally {
+    $('prog').hidden = true;
+    updateConn();
+  }
+};
+
+updateConn();
+</script>
+</body>
+</html>

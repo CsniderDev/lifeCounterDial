@@ -7,9 +7,14 @@
 //
 // Commander damage also costs life: confirming +N commander damage
 // subtracts N from your life total (and reducing it gives the life back).
+//
+// Commander art: the phone page in docs/index.html sends a 240x240 JPEG
+// over Bluetooth LE. It is stored in flash and drawn behind the life total.
 
 #include <M5Dial.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <NimBLEDevice.h>
 
 // ---------- tunables ----------
 static constexpr int  ENC_COUNTS_PER_DETENT = 4;   // raw encoder counts per knob click
@@ -78,14 +83,134 @@ static void maybeSave() {
   }
 }
 
+// ---------- commander art (received over BLE, stored in flash) ----------
+// Protocol (all on one GATT service):
+//   CTRL write 0x01 + uint32 LE size  -> begin transfer
+//   DATA write <bytes> ...            -> append chunks
+//   CTRL write 0x02                   -> finish; CTRL read gives "OK" or "ERR ..."
+//   CTRL write 0x03                   -> clear art
+static const char *BLE_NAME  = "MTG Dial";
+static const char *SVC_UUID  = "8d2b0001-5c3a-4e8f-9b7a-2f1e6c4d3a10";
+static const char *CTRL_UUID = "8d2b0002-5c3a-4e8f-9b7a-2f1e6c4d3a10";
+static const char *DATA_UUID = "8d2b0003-5c3a-4e8f-9b7a-2f1e6c4d3a10";
+
+static constexpr size_t MAX_ART_BYTES = 64 * 1024;
+static const char *ART_PATH = "/art.jpg";
+
+static uint8_t *artBuf = nullptr;  // JPEG being displayed (owned by main loop)
+static size_t   artLen = 0;
+static bool     fsOk   = false;
+
+// transfer state shared with the BLE task
+static uint8_t *volatile rxBuf = nullptr;
+static volatile size_t rxExpected = 0, rxGot = 0;
+static volatile bool   rxActive = false, rxDone = false, artClearReq = false;
+static volatile bool   bleConnected = false;
+static NimBLECharacteristic *ctrlChr = nullptr;
+
+static void setStatus(const char *s) { if (ctrlChr) ctrlChr->setValue(std::string(s)); }
+
+class ServerCB : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
+    bleConnected = true;
+    // ask for a short connection interval so transfers are quick (iOS min 15ms)
+    srv->updateConnParams(info.getConnHandle(), 12, 24, 0, 400);
+  }
+  void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int) override {
+    bleConnected = false;
+    rxActive = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class CtrlCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+    NimBLEAttValue v = c->getValue();
+    if (v.length() == 0) return;
+    const uint8_t *p = v.data();
+    switch (p[0]) {
+      case 0x01: {  // begin
+        if (v.length() < 5) { setStatus("ERR header"); return; }
+        if (rxDone) { setStatus("ERR busy"); return; }
+        uint32_t size = p[1] | (p[2] << 8) | (p[3] << 16) | ((uint32_t)p[4] << 24);
+        if (size == 0 || size > MAX_ART_BYTES) { setStatus("ERR size"); return; }
+        rxActive = false;
+        free(rxBuf);
+        rxBuf = (uint8_t *)malloc(size);
+        if (!rxBuf) { setStatus("ERR memory"); return; }
+        rxExpected = size;
+        rxGot = 0;
+        rxActive = true;
+        setStatus("RX");
+        break;
+      }
+      case 0x02: {  // end
+        if (!rxActive) { setStatus("ERR state"); return; }
+        rxActive = false;
+        if (rxGot != rxExpected) { setStatus("ERR short"); return; }
+        if (rxBuf[0] != 0xFF || rxBuf[1] != 0xD8) { setStatus("ERR not jpeg"); return; }
+        rxDone = true;  // main loop takes ownership of rxBuf
+        setStatus("OK");
+        break;
+      }
+      case 0x03:
+        artClearReq = true;
+        setStatus("CLEARED");
+        break;
+    }
+  }
+};
+
+class DataCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+    if (!rxActive) return;
+    NimBLEAttValue v = c->getValue();
+    size_t n = min((size_t)v.length(), (size_t)(rxExpected - rxGot));
+    memcpy(rxBuf + rxGot, v.data(), n);
+    rxGot += n;
+  }
+};
+
+static void bleInit() {
+  NimBLEDevice::init(BLE_NAME);
+  NimBLEDevice::setMTU(247);
+  NimBLEServer *srv = NimBLEDevice::createServer();
+  srv->setCallbacks(new ServerCB());
+  NimBLEService *svc = srv->createService(SVC_UUID);
+  ctrlChr = svc->createCharacteristic(
+      CTRL_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  ctrlChr->setCallbacks(new CtrlCB());
+  setStatus("idle");
+  NimBLECharacteristic *dataChr = svc->createCharacteristic(
+      DATA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  dataChr->setCallbacks(new DataCB());
+  svc->start();
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setName(BLE_NAME);
+  adv->enableScanResponse(true);
+  adv->start();
+}
+
+static void artLoad() {
+  if (!fsOk) return;
+  File f = LittleFS.open(ART_PATH, "r");
+  if (!f) return;
+  size_t n = f.size();
+  if (n > 0 && n <= MAX_ART_BYTES && (artBuf = (uint8_t *)malloc(n))) {
+    artLen = f.read(artBuf, n);
+  }
+  f.close();
+}
+
 // ---------- UI state ----------
 enum class Screen { Main, Menu, Edit, ConfirmReset };
-enum class Item   { Poison, Cmdr, Opponents, StartLife, NewGame, Back };
+enum class Item   { Poison, Cmdr, Opponents, StartLife, NewGame, ClearArt, Back };
 
 struct MenuItem { Item kind; int idx; };
 
 static Screen   screen = Screen::Main;
-static MenuItem menu[MAX_OPPONENTS + 6];
+static MenuItem menu[MAX_OPPONENTS + 7];
 static int      menuCount = 0;
 static int      menuSel   = 0;
 
@@ -107,6 +232,7 @@ static void buildMenu() {
   menu[menuCount++] = {Item::NewGame, 0};
   menu[menuCount++] = {Item::StartLife, 0};
   menu[menuCount++] = {Item::Opponents, 0};
+  if (artBuf) menu[menuCount++] = {Item::ClearArt, 0};
   menu[menuCount++] = {Item::Back, 0};
 }
 
@@ -117,6 +243,7 @@ static String itemLabel(const MenuItem &m) {
     case Item::Opponents: return "Opponents";
     case Item::StartLife: return "Starting Life";
     case Item::NewGame:   return "New Game";
+    case Item::ClearArt:  return "Clear Art";
     case Item::Back:      return "Back";
   }
   return "";
@@ -156,6 +283,17 @@ static void text(const String &s, int x, int y, const lgfx::IFont *font,
   canvas.drawString(s, x, y);
 }
 
+// Text with a black outline so it stays readable over card art.
+static void textOutlined(const String &s, int x, int y, const lgfx::IFont *font,
+                         float size, uint16_t color, int w = 2) {
+  if (artBuf) {
+    for (int dx = -w; dx <= w; dx += w)
+      for (int dy = -w; dy <= w; dy += w)
+        if (dx || dy) text(s, x + dx, y + dy, font, size, C_BG);
+  }
+  text(s, x, y, font, size, color);
+}
+
 static bool isLethal() {
   if (game.life <= 0 || game.poison >= 10) return true;
   for (int i = 0; i < game.opponents; i++)
@@ -167,6 +305,8 @@ static void drawMain() {
   bool lethal = isLethal();
   uint16_t lifeColor = lethal ? C_DEAD : (game.life <= 10 ? C_LOW : C_LIFE);
 
+  if (artBuf) canvas.drawJpg(artBuf, artLen, 0, 0);
+
   // ring showing life relative to starting life
   float frac = game.startLife > 0 ? (float)game.life / game.startLife : 0;
   frac = constrain(frac, 0.0f, 1.0f);
@@ -174,13 +314,19 @@ static void drawMain() {
   if (frac > 0)
     canvas.fillArc(120, 120, 119, 112, -90, -90 + 360 * frac, lifeColor);
 
-  text(String(game.life), 120, 118, &fonts::Font7, 2, lethal ? C_DEAD : C_TEXT);
+  textOutlined(String(game.life), 120, 118, &fonts::Font7, 2,
+               lethal ? C_DEAD : C_TEXT, 3);
 
   if (lifeDelta != 0 && millis() - lifeDeltaMs < DELTA_SHOW_MS) {
     String d = (lifeDelta > 0 ? "+" : "") + String(lifeDelta);
-    text(d, 120, 45, &fonts::FreeSansBold12pt7b, 1,
-         lifeDelta > 0 ? C_POISON : C_DEAD);
+    textOutlined(d, 120, 45, &fonts::FreeSansBold12pt7b, 1,
+                 lifeDelta > 0 ? C_POISON : C_DEAD);
   }
+
+  if (bleConnected) canvas.fillCircle(120, 24, 3, C_LIFE);
+  if (rxActive && rxExpected)
+    textOutlined("Receiving art " + String(rxGot * 100 / rxExpected) + "%",
+                 120, 222, &fonts::Font2, 1, C_ACCENT);
 
   // status line: poison + commander damage (only when non-zero)
   String st;
@@ -192,8 +338,9 @@ static void drawMain() {
     for (int i = 0; i < game.opponents; i++)
       st += (i ? "/" : "") + String(game.cmdr[i]);
   }
-  if (st.length()) text(st, 120, 185, &fonts::FreeSans9pt7b, 1, C_DIM);
-  if (lethal) text("LETHAL", 120, 205, &fonts::FreeSansBold9pt7b, 1, C_DEAD);
+  if (st.length()) textOutlined(st, 120, 185, &fonts::FreeSans9pt7b, 1,
+                                artBuf ? C_TEXT : C_DIM);
+  if (lethal) textOutlined("LETHAL", 120, 205, &fonts::FreeSansBold9pt7b, 1, C_DEAD);
 }
 
 static void drawMenuRow(int i, int y, bool selected) {
@@ -323,6 +470,7 @@ static void onPress() {
       const MenuItem &m = menu[menuSel];
       if (m.kind == Item::Back)         screen = Screen::Main;
       else if (m.kind == Item::NewGame) { confirmYes = false; screen = Screen::ConfirmReset; }
+      else if (m.kind == Item::ClearArt) { artClearReq = true; screen = Screen::Main; }
       else                              openEdit(m);
       break;
     }
@@ -350,6 +498,40 @@ static void onTap() {
   dirty = true;
 }
 
+// Hand-off of BLE results to the main loop (file I/O + drawing happen here).
+static void artPoll() {
+  if (rxDone) {
+    free(artBuf);
+    artBuf = rxBuf;
+    artLen = rxExpected;
+    rxBuf  = nullptr;
+    rxDone = false;
+    if (fsOk) {
+      File f = LittleFS.open(ART_PATH, "w");
+      if (f) { f.write(artBuf, artLen); f.close(); }
+    }
+    dirty = true;
+  }
+  if (artClearReq) {
+    artClearReq = false;
+    free(artBuf);
+    artBuf = nullptr;
+    artLen = 0;
+    if (fsOk) LittleFS.remove(ART_PATH);
+    dirty = true;
+  }
+
+  // refresh the main screen for transfer progress / connection dot
+  static bool lastConn = false;
+  static size_t lastPct = 0;
+  size_t pct = (rxActive && rxExpected) ? rxGot * 100 / rxExpected + 1 : 0;
+  if (bleConnected != lastConn || (pct / 5) != (lastPct / 5)) {
+    lastConn = bleConnected;
+    lastPct  = pct;
+    if (screen == Screen::Main) dirty = true;
+  }
+}
+
 // ---------- Arduino entry points ----------
 void setup() {
   auto cfg = M5.config();
@@ -360,6 +542,9 @@ void setup() {
   canvas.createSprite(240, 240);
 
   loadGame();
+  fsOk = LittleFS.begin(true);  // formats the storage partition on first boot
+  artLoad();
+  bleInit();
   encLast = M5Dial.Encoder.read();
   render();
 }
@@ -382,6 +567,7 @@ void loop() {
   bool nowVisible = lifeDelta != 0 && millis() - lifeDeltaMs < DELTA_SHOW_MS;
   if (nowVisible != deltaVisible) { deltaVisible = nowVisible; dirty = true; }
 
+  artPoll();
   if (dirty) { render(); dirty = false; }
   maybeSave();
   delay(5);
