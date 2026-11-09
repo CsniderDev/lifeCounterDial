@@ -14,7 +14,7 @@
 // ---------- tunables ----------
 static constexpr int  ENC_COUNTS_PER_DETENT = 4;   // raw encoder counts per knob click
 static constexpr int  ENC_DIRECTION         = 1;   // set to -1 if clockwise goes down
-static constexpr bool SOUND_ENABLED         = true;
+static constexpr bool SOUND_ENABLED         = false;
 static constexpr int  MAX_OPPONENTS         = 5;
 static constexpr uint32_t DELTA_SHOW_MS     = 2000; // how long "+3 / -5" stays visible
 static constexpr uint32_t SAVE_DELAY_MS     = 1500; // write to flash after this much idle
