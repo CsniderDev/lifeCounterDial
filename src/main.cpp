@@ -205,15 +205,19 @@ static void bleInit() {
   NimBLEDevice::init(BLE_NAME);
   NimBLEDevice::setMTU(247);
   NimBLEServer *srv = NimBLEDevice::createServer();
-  srv->setCallbacks(new ServerCB());
+  // static callback objects: bleInit() runs again after every wake from sleep
+  static ServerCB serverCB;
+  static CtrlCB   ctrlCB;
+  static DataCB   dataCB;
+  srv->setCallbacks(&serverCB, false);  // false = NimBLE must not delete it
   NimBLEService *svc = srv->createService(SVC_UUID);
   ctrlChr = svc->createCharacteristic(
       CTRL_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  ctrlChr->setCallbacks(new CtrlCB());
+  ctrlChr->setCallbacks(&ctrlCB);
   setStatus("idle");
   NimBLECharacteristic *dataChr = svc->createCharacteristic(
       DATA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-  dataChr->setCallbacks(new DataCB());
+  dataChr->setCallbacks(&dataCB);
   svc->start();
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
@@ -224,7 +228,7 @@ static void bleInit() {
 
 // ---------- UI state ----------
 enum class Screen { Main, Menu, Edit, ConfirmReset };
-enum class Item   { Poison, Cmdr, Opponents, StartLife, NewGame, ClearArt, Back };
+enum class Item   { Poison, Cmdr, Opponents, StartLife, NewGame, ClearArt, Sleep, Back };
 
 struct MenuItem { Item kind; int idx; };
 
@@ -241,6 +245,7 @@ static int      lifeDelta   = 0;
 static uint32_t lifeDeltaMs = 0;
 
 static bool dirty = true;
+static bool sleepReq = false;
 static M5Canvas canvas(&M5Dial.Display);
 static long encLast = 0;
 
@@ -252,6 +257,7 @@ static void buildMenu() {
   menu[menuCount++] = {Item::StartLife, 0};
   menu[menuCount++] = {Item::Opponents, 0};
   if (hasArt) menu[menuCount++] = {Item::ClearArt, 0};
+  menu[menuCount++] = {Item::Sleep, 0};
   menu[menuCount++] = {Item::Back, 0};
 }
 
@@ -263,6 +269,7 @@ static String itemLabel(const MenuItem &m) {
     case Item::StartLife: return "Starting Life";
     case Item::NewGame:   return "New Game";
     case Item::ClearArt:  return "Clear Art";
+    case Item::Sleep:     return "Sleep";
     case Item::Back:      return "Back";
   }
   return "";
@@ -492,6 +499,7 @@ static void onPress() {
       if (m.kind == Item::Back)         screen = Screen::Main;
       else if (m.kind == Item::NewGame) { confirmYes = false; screen = Screen::ConfirmReset; }
       else if (m.kind == Item::ClearArt) { artClearReq = true; screen = Screen::Main; }
+      else if (m.kind == Item::Sleep)    { sleepReq = true; screen = Screen::Main; }
       else                              openEdit(m);
       break;
     }
@@ -596,6 +604,48 @@ static void artPoll() {
   }
 }
 
+// ---------- sleep ----------
+// Light sleep: screen off, Bluetooth off, CPU halted; RAM is kept, so the game
+// resumes exactly where it was. The Dial's button (GPIO42) isn't an RTC pin,
+// so it can't wake deep sleep - but GPIO wake from light sleep works on any pin.
+static constexpr gpio_num_t BTN_PIN = GPIO_NUM_42;
+
+static void waitButtonReleased() {
+  while (digitalRead(BTN_PIN) == LOW) delay(10);
+  delay(50);  // debounce
+}
+
+static void goToSleep() {
+  prefs.putBytes("game", &game, sizeof(Game));  // save now, not after the delay
+  saveDirty = false;
+
+  uint8_t brightness = M5Dial.Display.getBrightness();
+  M5Dial.Display.setBrightness(0);
+  M5Dial.Display.sleep();
+
+  rxActive = false;
+  bleConnected = false;
+  ctrlChr = nullptr;
+  NimBLEDevice::deinit(true);
+
+  waitButtonReleased();  // the press that chose "Sleep" must not wake us
+  gpio_wakeup_enable(BTN_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();  // ...zzz... returns when the button is pressed
+  gpio_wakeup_disable(BTN_PIN);
+  waitButtonReleased();  // and the waking press must not open the menu
+
+  M5Dial.Display.wakeup();
+  M5Dial.Display.setBrightness(brightness);
+  bleInit();
+  M5Dial.update();  // swallow the wake press
+  M5Dial.update();
+  encLast = M5Dial.Encoder.read();  // ignore any knob turns while asleep
+  lifeDelta = 0;
+  screen = Screen::Main;
+  dirty = true;
+}
+
 // ---------- Arduino entry points ----------
 void setup() {
   auto cfg = M5.config();
@@ -631,6 +681,7 @@ void loop() {
   if (nowVisible != deltaVisible) { deltaVisible = nowVisible; dirty = true; }
 
   artPoll();
+  if (sleepReq) { sleepReq = false; goToSleep(); }
   if (dirty) { render(); dirty = false; }
   maybeSave();
   delay(5);
