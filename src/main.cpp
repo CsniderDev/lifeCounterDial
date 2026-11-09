@@ -9,12 +9,13 @@
 // subtracts N from your life total (and reducing it gives the life back).
 //
 // Commander art: the phone page in docs/index.html sends a 240x240 JPEG
-// over Bluetooth LE. It is stored in flash and drawn behind the life total.
+// over Bluetooth LE. It is decoded once and the raw pixels are written to the
+// "art" flash partition, which is memory-mapped and copied into each frame.
 
 #include <M5Dial.h>
 #include <Preferences.h>
-#include <LittleFS.h>
 #include <NimBLEDevice.h>
+#include <esp_partition.h>
 
 // ---------- tunables ----------
 static constexpr int  ENC_COUNTS_PER_DETENT = 4;   // raw encoder counts per knob click
@@ -86,26 +87,36 @@ static void maybeSave() {
 // ---------- commander art (received over BLE, stored in flash) ----------
 // Protocol (all on one GATT service):
 //   CTRL write 0x01 + uint32 LE size  -> begin transfer
-//   DATA write <bytes> ...            -> append chunks
-//   CTRL write 0x02                   -> finish; CTRL read gives "OK" or "ERR ..."
+//   DATA write uint32 LE offset + bytes -> chunk; only accepted if offset == bytes
+//                                        received so far (sender resumes from there)
+//   CTRL read                         -> "RX <received>" during a transfer,
+//                                        otherwise "OK" / "ERR ..." / "idle"
+//   CTRL write 0x02                   -> finish
 //   CTRL write 0x03                   -> clear art
 static const char *BLE_NAME  = "MTG Dial";
 static const char *SVC_UUID  = "8d2b0001-5c3a-4e8f-9b7a-2f1e6c4d3a10";
 static const char *CTRL_UUID = "8d2b0002-5c3a-4e8f-9b7a-2f1e6c4d3a10";
 static const char *DATA_UUID = "8d2b0003-5c3a-4e8f-9b7a-2f1e6c4d3a10";
 
-static constexpr size_t MAX_ART_BYTES = 64 * 1024;
-static const char *ART_PATH = "/art.jpg";
+static constexpr size_t MAX_ART_BYTES = 64 * 1024;          // incoming JPEG limit
+static constexpr size_t ART_PIX_BYTES = 240 * 240 * 2;      // decoded RGB565 frame
 
-static uint8_t *artBuf = nullptr;  // JPEG being displayed (owned by main loop)
-static size_t   artLen = 0;
-static bool     fsOk   = false;
+// Decoding a JPEG every frame made the knob laggy, and a second 115KB RAM
+// buffer leaves no room for Bluetooth. So the decoded pixels live in flash
+// and are read through the memory-mapped flash cache (no RAM cost).
+static const esp_partition_t *artPart = nullptr;
+static const void *artPix = nullptr;   // memory-mapped pixels, or null
+static esp_partition_mmap_handle_t artMapHandle;
+static bool hasArt = false;
+static volatile uint32_t lastRenderMs = 0;
 
 // transfer state shared with the BLE task
 static uint8_t *volatile rxBuf = nullptr;
 static volatile size_t rxExpected = 0, rxGot = 0;
 static volatile bool   rxActive = false, rxDone = false, artClearReq = false;
 static volatile bool   bleConnected = false;
+static volatile uint32_t rxLastMs = 0;
+static constexpr uint32_t RX_TIMEOUT_MS = 10000;
 static NimBLECharacteristic *ctrlChr = nullptr;
 
 static void setStatus(const char *s) { if (ctrlChr) ctrlChr->setValue(std::string(s)); }
@@ -140,8 +151,9 @@ class CtrlCB : public NimBLECharacteristicCallbacks {
         if (!rxBuf) { setStatus("ERR memory"); return; }
         rxExpected = size;
         rxGot = 0;
+        rxLastMs = millis();
         rxActive = true;
-        setStatus("RX");
+        setStatus("RX 0");
         break;
       }
       case 0x02: {  // end
@@ -157,7 +169,20 @@ class CtrlCB : public NimBLECharacteristicCallbacks {
         artClearReq = true;
         setStatus("CLEARED");
         break;
+      case 0x05: {  // diagnostics
+        char d[96];
+        snprintf(d, sizeof d, "heap=%u big=%u art=%d cached=%d render=%ums",
+                 (unsigned)ESP.getFreeHeap(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                 hasArt, artPix != nullptr, (unsigned)lastRenderMs);
+        setStatus(d);
+        break;
+      }
     }
+  }
+  // report live progress so the sender can resume after dropped packets
+  void onRead(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+    if (rxActive) setStatus(("RX " + std::to_string((unsigned)rxGot)).c_str());
   }
 };
 
@@ -165,9 +190,14 @@ class DataCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
     if (!rxActive) return;
     NimBLEAttValue v = c->getValue();
-    size_t n = min((size_t)v.length(), (size_t)(rxExpected - rxGot));
-    memcpy(rxBuf + rxGot, v.data(), n);
+    if (v.length() <= 4) return;
+    const uint8_t *p = v.data();
+    uint32_t off = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+    if (off != rxGot) return;  // out of order / duplicate: sender will resync
+    size_t n = min((size_t)v.length() - 4, (size_t)(rxExpected - rxGot));
+    memcpy(rxBuf + rxGot, p + 4, n);
     rxGot += n;
+    rxLastMs = millis();
   }
 };
 
@@ -190,17 +220,6 @@ static void bleInit() {
   adv->setName(BLE_NAME);
   adv->enableScanResponse(true);
   adv->start();
-}
-
-static void artLoad() {
-  if (!fsOk) return;
-  File f = LittleFS.open(ART_PATH, "r");
-  if (!f) return;
-  size_t n = f.size();
-  if (n > 0 && n <= MAX_ART_BYTES && (artBuf = (uint8_t *)malloc(n))) {
-    artLen = f.read(artBuf, n);
-  }
-  f.close();
 }
 
 // ---------- UI state ----------
@@ -232,7 +251,7 @@ static void buildMenu() {
   menu[menuCount++] = {Item::NewGame, 0};
   menu[menuCount++] = {Item::StartLife, 0};
   menu[menuCount++] = {Item::Opponents, 0};
-  if (artBuf) menu[menuCount++] = {Item::ClearArt, 0};
+  if (hasArt) menu[menuCount++] = {Item::ClearArt, 0};
   menu[menuCount++] = {Item::Back, 0};
 }
 
@@ -286,7 +305,7 @@ static void text(const String &s, int x, int y, const lgfx::IFont *font,
 // Text with a black outline so it stays readable over card art.
 static void textOutlined(const String &s, int x, int y, const lgfx::IFont *font,
                          float size, uint16_t color, int w = 2) {
-  if (artBuf) {
+  if (hasArt) {
     for (int dx = -w; dx <= w; dx += w)
       for (int dy = -w; dy <= w; dy += w)
         if (dx || dy) text(s, x + dx, y + dy, font, size, C_BG);
@@ -305,7 +324,7 @@ static void drawMain() {
   bool lethal = isLethal();
   uint16_t lifeColor = lethal ? C_DEAD : (game.life <= 10 ? C_LOW : C_LIFE);
 
-  if (artBuf) canvas.drawJpg(artBuf, artLen, 0, 0);
+  if (artPix) memcpy(canvas.getBuffer(), artPix, ART_PIX_BYTES);
 
   // ring showing life relative to starting life
   float frac = game.startLife > 0 ? (float)game.life / game.startLife : 0;
@@ -339,7 +358,7 @@ static void drawMain() {
       st += (i ? "/" : "") + String(game.cmdr[i]);
   }
   if (st.length()) textOutlined(st, 120, 185, &fonts::FreeSans9pt7b, 1,
-                                artBuf ? C_TEXT : C_DIM);
+                                hasArt ? C_TEXT : C_DIM);
   if (lethal) textOutlined("LETHAL", 120, 205, &fonts::FreeSansBold9pt7b, 1, C_DEAD);
 }
 
@@ -395,6 +414,7 @@ static void drawConfirm() {
 }
 
 static void render() {
+  uint32_t t0 = millis();
   canvas.fillScreen(C_BG);
   switch (screen) {
     case Screen::Main:         drawMain();    break;
@@ -403,6 +423,7 @@ static void render() {
     case Screen::ConfirmReset: drawConfirm(); break;
   }
   canvas.pushSprite(0, 0);
+  lastRenderMs = millis() - t0;
 }
 
 // ---------- input handling ----------
@@ -498,26 +519,69 @@ static void onTap() {
   dirty = true;
 }
 
-// Hand-off of BLE results to the main loop (file I/O + drawing happen here).
+// ---------- art storage ----------
+static void artUnmap() {
+  if (artPix) { esp_partition_munmap(artMapHandle); artPix = nullptr; }
+}
+
+static void artMap() {
+  artUnmap();
+  if (artPart && esp_partition_mmap(artPart, 0, ART_PIX_BYTES, ESP_PARTITION_MMAP_DATA,
+                                    &artPix, &artMapHandle) != ESP_OK)
+    artPix = nullptr;
+  hasArt = artPix != nullptr;
+}
+
+static void artInit() {
+  artPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                     (esp_partition_subtype_t)0x40, "art");
+  if (artPart && prefs.getBool("art", false)) artMap();
+}
+
+// Decode the JPEG once (into the frame buffer, which is free between redraws),
+// then save the raw pixels to the art partition. Frees `jpg`.
+static void artSet(uint8_t *jpg, size_t len) {
+  if (!artPart) { free(jpg); return; }
+  canvas.fillScreen(TFT_BLACK);
+  bool ok = canvas.drawJpg(jpg, len, 0, 0);
+  free(jpg);
+  if (!ok) return;
+  artUnmap();
+  if (esp_partition_erase_range(artPart, 0, artPart->size) == ESP_OK &&
+      esp_partition_write(artPart, 0, canvas.getBuffer(), ART_PIX_BYTES) == ESP_OK) {
+    prefs.putBool("art", true);
+    artMap();
+  } else {
+    prefs.putBool("art", false);
+    hasArt = false;
+  }
+}
+
+static void artClear() {
+  artUnmap();
+  hasArt = false;
+  prefs.putBool("art", false);
+}
+
+// Hand-off of BLE results to the main loop (flash writes + drawing happen here).
 static void artPoll() {
   if (rxDone) {
-    free(artBuf);
-    artBuf = rxBuf;
-    artLen = rxExpected;
+    uint8_t *jpg = rxBuf;
+    size_t len = rxExpected;
     rxBuf  = nullptr;
     rxDone = false;
-    if (fsOk) {
-      File f = LittleFS.open(ART_PATH, "w");
-      if (f) { f.write(artBuf, artLen); f.close(); }
-    }
+    artSet(jpg, len);
     dirty = true;
   }
   if (artClearReq) {
     artClearReq = false;
-    free(artBuf);
-    artBuf = nullptr;
-    artLen = 0;
-    if (fsOk) LittleFS.remove(ART_PATH);
+    artClear();
+    dirty = true;
+  }
+
+  if (rxActive && millis() - rxLastMs > RX_TIMEOUT_MS) {
+    rxActive = false;
+    setStatus("ERR timeout");
     dirty = true;
   }
 
@@ -542,8 +606,7 @@ void setup() {
   canvas.createSprite(240, 240);
 
   loadGame();
-  fsOk = LittleFS.begin(true);  // formats the storage partition on first boot
-  artLoad();
+  artInit();
   bleInit();
   encLast = M5Dial.Encoder.read();
   render();

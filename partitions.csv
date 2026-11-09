@@ -1,0 +1,11 @@
+# Same layout as the board's default 8MB table, except 128KB is carved off the
+# end of spiffs for "art": the decoded 240x240 RGB565 background (115,200 bytes).
+# Offsets of nvs/app partitions are unchanged, so saved game state is kept.
+# Name,    Type, SubType,  Offset,   Size
+nvs,       data, nvs,      0x9000,   0x5000
+otadata,   data, ota,      0xe000,   0x2000
+app0,      app,  ota_0,    0x10000,  0x330000
+app1,      app,  ota_1,    0x340000, 0x330000
+spiffs,    data, spiffs,   0x670000, 0x160000
+art,       data, 0x40,     0x7D0000, 0x20000
+coredump,  data, coredump, 0x7F0000, 0x10000

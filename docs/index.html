@@ -110,7 +110,8 @@
 const SVC  = '8d2b0001-5c3a-4e8f-9b7a-2f1e6c4d3a10';
 const CTRL = '8d2b0002-5c3a-4e8f-9b7a-2f1e6c4d3a10';
 const DATA = '8d2b0003-5c3a-4e8f-9b7a-2f1e6c4d3a10';
-const CHUNK = 180;            // fits in one packet with iOS's usual MTU
+const CHUNK = 176;            // + 4-byte offset header = 180, fits iOS's usual MTU
+const BATCH = 24;             // chunks sent without response before syncing
 const MAX_BYTES = 60 * 1024;  // device limit is 64KB
 
 const $ = id => document.getElementById(id);
@@ -150,9 +151,29 @@ async function ensureConnected() {
 const write = (ch, bytes) =>
   ch.writeValueWithResponse ? ch.writeValueWithResponse(bytes) : ch.writeValue(bytes);
 
+const writeFast = (ch, bytes) =>
+  ch.writeValueWithoutResponse ? ch.writeValueWithoutResponse(bytes) : write(ch, bytes);
+
 async function readStatus() {
   const v = await ctrlCh.readValue();
-  return new TextDecoder().decode(v.buffer);
+  // decode only this DataView's bytes, not the whole underlying buffer
+  return new TextDecoder().decode(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+}
+
+// "RX 1234" -> 1234, anything else -> throws
+async function readReceived() {
+  const st = await readStatus();
+  const m = /^RX (\d+)$/.exec(st);
+  if (!m) throw new Error('Dial reported: ' + st);
+  return +m[1];
+}
+
+function packet(bytes, off) {
+  const n = Math.min(CHUNK, bytes.length - off);
+  const p = new Uint8Array(4 + n);
+  new DataView(p.buffer).setUint32(0, off, true);
+  p.set(bytes.subarray(off, off + n), 4);
+  return p;
 }
 
 $('connectBtn').onclick = async () => {
@@ -177,17 +198,24 @@ async function sendJpeg(bytes) {
   head[0] = 1;
   new DataView(head.buffer).setUint32(1, bytes.length, true);
   await write(ctrlCh, head);
-  let st = await readStatus();
-  if (st !== 'RX') throw new Error('Dial refused transfer: ' + st);
+  let got = await readReceived();
 
   const prog = $('prog');
   prog.hidden = false; prog.value = 0;
-  for (let off = 0; off < bytes.length; off += CHUNK) {
-    await write(dataCh, bytes.subarray(off, off + CHUNK));
-    prog.value = Math.min(1, (off + CHUNK) / bytes.length);
+  let stalls = 0;
+  while (got < bytes.length) {
+    // send a batch fast, then ask the Dial how far it really got and resume there
+    let off = got;
+    for (let i = 0; i < BATCH && off < bytes.length; i++, off += CHUNK)
+      await writeFast(dataCh, packet(bytes, off));
+    const before = got;
+    got = await readReceived();
+    prog.value = got / bytes.length;
+    stalls = got === before ? stalls + 1 : 0;
+    if (stalls >= 5) throw new Error('Transfer stalled at ' + got + ' bytes');
   }
   await write(ctrlCh, new Uint8Array([2]));
-  st = await readStatus();
+  const st = await readStatus();
   if (st !== 'OK') throw new Error('Dial reported: ' + st);
 }
 
